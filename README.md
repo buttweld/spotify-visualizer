@@ -18,11 +18,11 @@ sudo apt install -y git curl python3 python3-venv python3-pip \
     alsa-utils libdrm-dev libopenblas0-pthread fonts-dejavu-core
 ```
 
-Clone the project (substitute its repository URL):
+Clone the project:
 
 ```bash
 cd ~
-git clone <repository-url> spotify-visualizer
+git clone https://github.com/buttweld/spotify-visualizer.git
 cd spotify-visualizer
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt

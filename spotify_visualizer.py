@@ -9,12 +9,16 @@ Start this program before initiating Spotify Connect playback.
 """
 
 import os
+import getpass
+import re
+import socket
 import subprocess
 import threading
 import time
 
 import numpy as np
 from drm_display import Screen
+from PIL import Image, ImageDraw, ImageFont
 
 # ---------------- CONFIGURATION ----------------
 
@@ -29,6 +33,14 @@ FPS = 24
 HOP = round(RATE / FPS)
 FFT_SIZE = 8192
 
+ALSA_BUFFER = 60_000  # microseconds
+ALSA_PERIOD = 15_000  # microseconds
+
+IDLE_TIMEOUT = 30.0  # seconds without non-silent PCM
+IDLE_RMS_THRESHOLD = 0.0002
+IDLE_REFRESH = 30.0  # seconds between network info refreshes
+DEVICE_NAME = os.environ.get("LIBRESPOT_NAME", f"raspotify ({socket.gethostname()})")
+
 BANDS = 38
 SEGMENTS = 21
 
@@ -41,9 +53,6 @@ PEAK_FALLOFF = 0.65
 
 DB_MIN = -65.0
 DB_MAX = 5.0
-
-ALSA_BUFFER = 40_000    # 40 ms
-ALSA_PERIOD = 10_000    # 10 ms
 
 # BGRA reference palette, bottom to top
 BASE_PALETTE = np.array([
@@ -89,7 +98,64 @@ for i in range(BANDS):
 levels = np.zeros(BANDS, dtype=np.float32)
 lock = threading.Lock()
 stop = threading.Event()
+last_audio_activity = time.monotonic() - IDLE_TIMEOUT
 
+
+def local_ipv4():
+    """Read the preferred LAN source IP without sending network traffic."""
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "route", "get", "1.1.1.1"],
+            capture_output=True, text=True, timeout=2, check=True,
+        )
+        match = re.search(r"\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})", result.stdout)
+        if match:
+            return match.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            capture_output=True, text=True, timeout=2, check=True,
+        )
+        match = re.search(r"\binet\s+(\d{1,3}(?:\.\d{1,3}){3})/", result.stdout)
+        if match:
+            return match.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "Not connected"
+
+
+def draw_idle_screen(width, height):
+    """Render a plain, small-text idle screen on black."""
+    ip = local_ipv4()
+    hostname = socket.gethostname()
+    user = getpass.getuser()
+
+    lines = [
+        "spotify-visualizer",
+        f"stream to {DEVICE_NAME}",
+        f"ssh {user}@{ip}",
+        f"IP Address: {ip}",
+        f"Hostname: {hostname}",
+    ]
+
+    image = Image.new("RGB", (width, height), "black")
+    draw = ImageDraw.Draw(image)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    font = (ImageFont.truetype(font_path, 12)
+            if os.path.isfile(font_path) else ImageFont.load_default())
+
+    x, y = 24, 24
+    for line in lines:
+        draw.text((x, y), line, font=font, fill="white")
+        y += 24
+
+    rgb = np.asarray(image, dtype=np.uint8)
+    bgra = np.empty((height, width, 4), dtype=np.uint8)
+    bgra[:, :, :3] = rgb[:, :, ::-1]
+    bgra[:, :, 3] = 255
+    return bgra
 
 def read_chunk(fifo, size):
     """Accumulate a complete audio chunk; never discard partial sample frames."""
@@ -108,6 +174,7 @@ def audio_worker():
     """Consume Spotify PCM, forward it to HDMI, and compute FFT levels."""
     chunk_bytes = HOP * CHANNELS * 2
     buffer = np.zeros(FFT_SIZE, dtype=np.float32)
+    global last_audio_activity
 
     while not stop.is_set():
         player = None
@@ -120,8 +187,7 @@ def audio_worker():
                         "aplay", "-q", "-D", AUDIO_DEVICE,
                         "-t", "raw", "-f", "S16_LE",
                         "-r", str(RATE), "-c", str(CHANNELS),
-                        "-B", str(ALSA_BUFFER),
-                        "-F", str(ALSA_PERIOD),
+                        "-B", str(ALSA_BUFFER), "-F", str(ALSA_PERIOD),
                     ],
                     stdin=subprocess.PIPE,
                     bufsize=0,
@@ -140,6 +206,12 @@ def audio_worker():
                     samples = np.frombuffer(pcm, dtype="<i2")
                     mono = samples.reshape(-1, CHANNELS).mean(axis=1)
                     mono = mono.astype(np.float32) / 32768.0
+                    # Silence alone is not active playback. Update the
+                    # timestamp while holding the same lock used by rendering.
+                    rms = float(np.sqrt(np.mean(mono * mono)))
+                    if rms > IDLE_RMS_THRESHOLD:
+                        with lock:
+                            last_audio_activity = time.monotonic()
                     n = min(len(mono), FFT_SIZE)
                     buffer[:-n] = buffer[n:]
                     buffer[-n:] = mono[-n:]
@@ -212,6 +284,8 @@ def main():
         next_frame = previous_frame = time.monotonic()
         frames = 0
         fps_start = previous_frame
+        idle_visible = False
+        idle_last_refresh = 0.0
 
         try:
             while True:
@@ -221,6 +295,29 @@ def main():
 
                 with lock:
                     target = levels.copy()
+                    idle = start - last_audio_activity >= IDLE_TIMEOUT
+
+                if idle:
+                    if not idle_visible or start - idle_last_refresh >= IDLE_REFRESH:
+                        canvas[:] = draw_idle_screen(w, h)
+                        screen.show(canvas)
+                        idle_last_refresh = start
+                        idle_visible = True
+                        print("\nIdle screen active", flush=True)
+                    # No need to redraw or calculate FFT graphics while idle.
+                    time.sleep(0.10)
+                    next_frame = previous_frame = time.monotonic()
+                    displayed.fill(0)
+                    peaks.fill(0)
+                    peak_hold.fill(0)
+                    continue
+
+                if idle_visible:
+                    print("\nPlayback detected; resuming spectrum", flush=True)
+                    idle_visible = False
+                    canvas[:] = BG
+                    next_frame = previous_frame = time.monotonic()
+                    dt = 0.0
 
                 displayed = np.maximum(target, displayed - BAR_FALLOFF * dt)
 

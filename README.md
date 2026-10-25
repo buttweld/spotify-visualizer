@@ -15,7 +15,7 @@ Install dependencies:
 ```bash
 sudo apt update
 sudo apt install -y git curl python3 python3-venv python3-pip \
-    alsa-utils libdrm-dev libopenblas0-pthread fonts-dejavu-core
+    alsa-utils libdrm-dev libopenblas0-pthread fonts-dejavu-core v4l-utils
 ```
 
 Clone the project:
@@ -66,7 +66,7 @@ Test the visualizer in one terminal:
 
 ```bash
 cd ~/spotify-visualizer
-.venv/bin/python spotify_visualizer.py
+sudo .venv/bin/python spotify_visualizer.py
 ```
 
 In another terminal, restart Raspotify and play music using Spotify Connect:
@@ -90,6 +90,7 @@ Type=simple
 User=<username>
 Group=<username>
 SupplementaryGroups=audio video render
+AmbientCapabilities=CAP_NET_ADMIN
 WorkingDirectory=/home/<username>/spotify-visualizer
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/raspotify/conf
@@ -135,8 +136,12 @@ Edit the constants near the top of `spotify_visualizer.py`:
 | `FIFO` | Raspotify PCM named pipe. |
 | `AUDIO_DEVICE` | HDMI ALSA device; list devices using `aplay -l`. |
 | `DRM_DEVICE` | DRM/KMS display device. |
+| `CEC_DEVICE` | HDMI-CEC adapter; defaults to `/dev/cec0`. |
 | `RATE`, `CHANNELS` | PCM input format (44,100 Hz, stereo). |
 | `FPS`, `HOP` | Display frame rate and PCM samples processed per update. |
+| `VISUAL_DELAY` | Initial spectrum delay in seconds; defaults to `0.300`. |
+| `VISUAL_DELAY_STEP`, `VISUAL_DELAY_MAX` | Remote adjustment step and maximum delay in seconds. |
+| `VISUAL_DELAY_INFO_TIMEOUT` | Seconds to show the delay after a remote adjustment; defaults to `2.0`. |
 | `FFT_SIZE` | FFT window length; larger windows improve frequency resolution but smooth fast changes. |
 | `BANDS`, `SEGMENTS` | Spectrum bars and blocks per bar. |
 | `WIDTH`, `HEIGHT` | Requested HDMI output resolution. |
@@ -150,6 +155,21 @@ Edit the constants near the top of `spotify_visualizer.py`:
 | `DEVICE_NAME` | Spotify Connect name read from the `LIBRESPOT_NAME` environment variable; defaults to `raspotify (<hostname>)`. |
 
 Defaults include **720 × 400**, **24 FPS**, **38 bands**, **21 segments**, **8192-point FFT**, **60 ms ALSA buffer**, **15 ms ALSA period**, and a **30-second idle timeout**.
+
+## HDMI-CEC Remote Control
+
+Enable HDMI-CEC on the TV and select the Pi's HDMI input. The visualizer registers as `SpotifyVis` using `cec-ctl` through `hdmi_cec.py`. The service's `AmbientCapabilities=CAP_NET_ADMIN` setting allows CEC monitoring.
+
+| Button | Action |
+| --- | --- |
+| Up | Increase visual delay by 20 ms. |
+| Down | Decrease visual delay by 20 ms. |
+
+Delay ranges from **0–2000 ms** and affects only the spectrum. Each press logs the value and shows `Delay: +300 ms` for **2 seconds**, below the hostname on the idle screen or at the top left of the spectrum. Further presses restart the timer.
+
+Held-button repeats are ignored. Adjustments work during playback and while idle, and reset to `VISUAL_DELAY` on restart.
+
+## Idle Screen
 
 The idle screen appears **immediately after startup**. After audio playback stops or becomes silent, it reappears following `IDLE_TIMEOUT`. Playback automatically returns the display to the spectrum. The idle screen shows:
 
@@ -171,3 +191,5 @@ To display the configured Raspotify device name, the visualizer service loads `E
 - **No HDMI audio:** Check ALSA devices with `aplay -l` and set `AUDIO_DEVICE` accordingly.
 - **Low FPS:** Reduce `WIDTH` and `HEIGHT` to decrease framebuffer transfer cost.
 - **Audio lags behind graphics:** Adjust ALSA buffering.
+- **CEC permission error:** Add `AmbientCapabilities=CAP_NET_ADMIN` under the visualizer service's `[Service]` section, then reload systemd and restart the service.
+- **Remote buttons do nothing:** Enable TV HDMI-CEC and select the Pi's input. Test with `sudo cec-ctl -d /dev/cec0 --playback --osd-name SpotifyVis --monitor`.

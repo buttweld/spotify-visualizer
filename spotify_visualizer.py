@@ -8,6 +8,7 @@ Expected Raspotify settings:
 Start this program before initiating Spotify Connect playback.
 """
 
+from collections import deque
 import os
 import getpass
 import re
@@ -15,21 +16,26 @@ import socket
 import subprocess
 import threading
 import time
-
 import numpy as np
 from drm_display import Screen
 from PIL import Image, ImageDraw, ImageFont
 
-# ---------------- CONFIGURATION ----------------
+from hdmi_cec import monitor_cec
 
+# ---------------- CONFIGURATION ----------------
 FIFO = "/run/spotify-vis/audio.pcm"
 AUDIO_DEVICE = "plughw:CARD=vc4hdmi,DEV=0"
 DRM_DEVICE = "/dev/dri/card0"
+CEC_DEVICE = "/dev/cec0"
 
 # Librespot's raw pipe output is normally 44.1 kHz, S16_LE, stereo.
 RATE = 44100
 CHANNELS = 2
 FPS = 24
+VISUAL_DELAY = 0.300  # seconds; delay spectrum only, not audio
+VISUAL_DELAY_STEP = 0.020  # seconds per Up/Down press
+VISUAL_DELAY_MAX = 2.000  # seconds; also determines spectrum history capacity
+VISUAL_DELAY_INFO_TIMEOUT = 2.0  # seconds to show delay after an Up/Down press
 HOP = round(RATE / FPS)
 FFT_SIZE = 8192
 
@@ -95,10 +101,73 @@ for i in range(BANDS):
     end = max(start + 1, int(np.searchsorted(FREQ, EDGES[i + 1])))
     BINS.append((start, end))
 
-levels = np.zeros(BANDS, dtype=np.float32)
+# Bounded history of 38-value FFT results (~160 bytes per frame).
+spectrum_history = deque(maxlen=max(4, int(max(VISUAL_DELAY, VISUAL_DELAY_MAX) * FPS) + 5))
+zero_levels = np.zeros(BANDS, dtype=np.float32)
 lock = threading.Lock()
 stop = threading.Event()
 last_audio_activity = time.monotonic() - IDLE_TIMEOUT
+visual_delay = min(VISUAL_DELAY_MAX, max(0.0, VISUAL_DELAY))
+visual_delay_info_until = 0.0
+
+
+def handle_cec_press(button):
+    """Adjust spectrum timing once per Up/Down press, including while idle."""
+    global visual_delay, visual_delay_info_until
+    if button not in ("up", "down"):
+        return
+    adjustment = VISUAL_DELAY_STEP if button == "up" else -VISUAL_DELAY_STEP
+    with lock:
+        visual_delay = round(min(VISUAL_DELAY_MAX, max(0.0, visual_delay + adjustment)), 6)
+        delay_ms = round(visual_delay * 1000)
+        visual_delay_info_until = time.monotonic() + VISUAL_DELAY_INFO_TIMEOUT
+    print(f"\nVisual delay: {delay_ms} ms", flush=True)
+
+
+def visual_delay_info(now):
+    """Return the temporary delay label. Caller must hold lock."""
+    if now < visual_delay_info_until:
+        return f"Delay: {round(visual_delay * 1000):+d} ms"
+    return None
+
+
+def render_delay_info(text):
+    """Render a small BGRA label, cached by the display loop until it changes."""
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    font = (ImageFont.truetype(font_path, 12)
+            if os.path.isfile(font_path) else ImageFont.load_default())
+    width = font.getbbox(text)[2] + 1
+    image = Image.new("RGB", (width, 24), "black")
+    ImageDraw.Draw(image).text((0, 0), text, font=font, fill="white")
+    rgb = np.asarray(image, dtype=np.uint8)
+    patch = np.empty((24, width, 4), dtype=np.uint8)
+    patch[:, :, :3] = rgb[:, :, ::-1]
+    patch[:, :, 3] = 255
+    return patch
+
+
+def show_delay_info(canvas, patch, idle=False, clear=True):
+    """Replace the delay line, including clearing it when the timer expires."""
+    x, y = 24, 144 if idle else 24
+    height, width = canvas.shape[:2]
+    if y >= height or x >= width:
+        return
+    bottom = min(y + 24, height)
+    if clear:
+        canvas[y:bottom, x:] = BG
+    if patch is not None:
+        right = min(x + patch.shape[1], width)
+        canvas[y:bottom, x:right] = patch[:bottom - y, :right - x]
+
+
+def delayed_spectrum(now):
+    """Return the newest eligible spectrum. Caller must hold lock."""
+    cutoff = now - visual_delay
+    # Keep older frames so increasing the delay can use them immediately.
+    for timestamp, spectrum in reversed(spectrum_history):
+        if timestamp <= cutoff:
+            return spectrum
+    return zero_levels
 
 
 def local_ipv4():
@@ -155,18 +224,22 @@ def draw_idle_screen(width, height):
     bgra = np.empty((height, width, 4), dtype=np.uint8)
     bgra[:, :, :3] = rgb[:, :, ::-1]
     bgra[:, :, 3] = 255
+
     return bgra
+
 
 def read_chunk(fifo, size):
     """Accumulate a complete audio chunk; never discard partial sample frames."""
     chunks = []
     remaining = size
+
     while remaining and not stop.is_set():
         data = fifo.read(remaining)
         if not data:
             return None  # Writer disconnected; discard incomplete final chunk.
         chunks.append(data)
         remaining -= len(data)
+
     return b"".join(chunks) if not stop.is_set() else None
 
 
@@ -212,6 +285,7 @@ def audio_worker():
                     if rms > IDLE_RMS_THRESHOLD:
                         with lock:
                             last_audio_activity = time.monotonic()
+
                     n = min(len(mono), FFT_SIZE)
                     buffer[:-n] = buffer[n:]
                     buffer[-n:] = mono[-n:]
@@ -228,12 +302,13 @@ def audio_worker():
                         )
 
                     with lock:
-                        levels[:] = updated
+                        spectrum_history.append((time.monotonic(), updated))
 
         except (OSError, BrokenPipeError, ValueError) as exc:
             if not stop.is_set():
                 print(f"Audio error: {exc}", flush=True)
                 time.sleep(1)
+
         finally:
             if player is not None:
                 if player.stdin is not None and not player.stdin.closed:
@@ -245,7 +320,7 @@ def audio_worker():
                     player.wait()
 
             with lock:
-                levels.fill(0)
+                spectrum_history.clear()
             buffer.fill(0)
 
 
@@ -281,29 +356,45 @@ def main():
         thread = threading.Thread(target=audio_worker, daemon=True)
         thread.start()
 
+        cec_thread = threading.Thread(
+            target=monitor_cec, args=(handle_cec_press, stop, CEC_DEVICE), daemon=True,
+        )
+
         next_frame = previous_frame = time.monotonic()
         frames = 0
         fps_start = previous_frame
         idle_visible = False
         idle_last_refresh = 0.0
+        delay_text = None
+        delay_patch = None
 
         try:
+            cec_thread.start()
             while True:
                 start = time.monotonic()
                 dt = min(start - previous_frame, 0.1)
                 previous_frame = start
 
                 with lock:
-                    target = levels.copy()
                     idle = start - last_audio_activity >= IDLE_TIMEOUT
+                    target = delayed_spectrum(start)
+                    new_delay_text = visual_delay_info(start)
+
+                delay_info_changed = new_delay_text != delay_text
+                if delay_info_changed:
+                    delay_text = new_delay_text
+                    delay_patch = render_delay_info(delay_text) if delay_text is not None else None
 
                 if idle:
-                    if not idle_visible or start - idle_last_refresh >= IDLE_REFRESH:
+                    refresh_idle = not idle_visible or start - idle_last_refresh >= IDLE_REFRESH
+                    if refresh_idle:
                         canvas[:] = draw_idle_screen(w, h)
-                        screen.show(canvas)
                         idle_last_refresh = start
                         idle_visible = True
                         print("\nIdle screen active", flush=True)
+                    if refresh_idle or delay_info_changed:
+                        show_delay_info(canvas, delay_patch, idle=True)
+                        screen.show(canvas)
                     # No need to redraw or calculate FFT graphics while idle.
                     time.sleep(0.10)
                     next_frame = previous_frame = time.monotonic()
@@ -332,6 +423,9 @@ def main():
                             displayed[i], peaks[i] - PEAK_FALLOFF * dt
                         )
 
+                # Clear the old label before drawing bars, so even small
+                # display modes can draw spectrum beneath the overlay.
+                show_delay_info(canvas, None)
                 canvas[max(0, top - 5):min(h, bottom + 5), :] = BG
 
                 for i in range(BANDS):
@@ -348,6 +442,9 @@ def main():
                         py = max(top, bottom - (peak_seg + 1) * segment_step)
                         canvas[py:py + 3, x:x2] = PEAK_COLOR
 
+                if delay_patch is not None:
+                    # Draw after the bars to keep the label on top.
+                    show_delay_info(canvas, delay_patch, clear=False)
                 screen.show(canvas)
                 frames += 1
                 now = time.monotonic()
@@ -366,11 +463,14 @@ def main():
 
         except KeyboardInterrupt:
             print("\nStopping...", flush=True)
+
         finally:
             stop.set()
             # The worker can be blocked waiting for FIFO data; daemon=True
             # ensures Ctrl+C can still terminate the application.
             thread.join(timeout=1)
+            if cec_thread.ident is not None:
+                cec_thread.join(timeout=3)
 
 
 if __name__ == "__main__":

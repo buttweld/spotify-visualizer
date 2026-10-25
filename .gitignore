@@ -15,7 +15,7 @@ credentials*
 *token*
 .cache/
 .spotify/
-scripts/
+/scripts/sync_to_rpi.sh
 
 # Runtime
 *.log

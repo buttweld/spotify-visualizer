@@ -15,6 +15,7 @@ credentials*
 *token*
 .cache/
 .spotify/
+scripts/
 
 # Runtime
 *.log
@@ -29,4 +30,3 @@ credentials*
 # OS
 .DS_Store
 Thumbs.db
-

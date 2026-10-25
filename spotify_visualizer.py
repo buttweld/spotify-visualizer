@@ -12,85 +12,24 @@ from collections import deque
 import os
 import getpass
 import re
+import queue
 import socket
 import subprocess
+import signal
 import threading
+import textwrap
 import time
 import numpy as np
 from drm_display import Screen
 from PIL import Image, ImageDraw, ImageFont
 
 from hdmi_cec import monitor_cec
+from visualizer.state import DisplayState, Mode
+from visualizer.render import Output, Spectrum
+from visualizer.photos.controller import PhotoLibrary, PhotoFrames
+from visualizer.photos.render import instruction_frame
 
-# ---------------- CONFIGURATION ----------------
-FIFO = "/run/spotify-vis/audio.pcm"
-AUDIO_DEVICE = "plughw:CARD=vc4hdmi,DEV=0"
-DRM_DEVICE = "/dev/dri/card0"
-CEC_DEVICE = "/dev/cec0"
-
-# Librespot's raw pipe output is normally 44.1 kHz, S16_LE, stereo.
-RATE = 44100
-CHANNELS = 2
-FPS = 24
-VISUAL_DELAY = 0.300  # seconds; delay spectrum only, not audio
-VISUAL_DELAY_STEP = 0.020  # seconds per Up/Down press
-VISUAL_DELAY_MAX = 2.000  # seconds; also determines spectrum history capacity
-VISUAL_DELAY_INFO_TIMEOUT = 2.0  # seconds to show delay after an Up/Down press
-HOP = round(RATE / FPS)
-FFT_SIZE = 8192
-
-ALSA_BUFFER = 60_000  # microseconds
-ALSA_PERIOD = 15_000  # microseconds
-
-IDLE_TIMEOUT = 30.0  # seconds without non-silent PCM
-IDLE_RMS_THRESHOLD = 0.0002
-IDLE_REFRESH = 30.0  # seconds between network info refreshes
-DEVICE_NAME = os.environ.get("LIBRESPOT_NAME", f"raspotify ({socket.gethostname()})")
-
-BANDS = 38
-SEGMENTS = 21
-
-WIDTH = 720
-HEIGHT = 400
-
-BAR_FALLOFF = 1.8
-PEAK_HOLD = 0.20
-PEAK_FALLOFF = 0.65
-
-DB_MIN = -65.0
-DB_MAX = 5.0
-
-# BGRA reference palette, bottom to top
-BASE_PALETTE = np.array([
-    (8, 132, 24, 255),
-    (0, 148, 41, 255),
-    (8, 156, 49, 255),
-    (16, 181, 57, 255),
-    (16, 190, 50, 255),
-    (16, 206, 41, 255),
-    (33, 222, 148, 255),
-    (41, 222, 189, 255),
-    (33, 181, 214, 255),
-    (24, 165, 222, 255),
-    (8, 123, 198, 255),
-    (0, 115, 214, 255),
-    (0, 102, 214, 255),
-    (0, 90, 214, 255),
-    (16, 41, 206, 255),
-    (16, 49, 239, 255),
-], dtype=np.uint8)
-
-PALETTE = np.column_stack([
-    np.interp(
-        np.linspace(0, 1, SEGMENTS),
-        np.linspace(0, 1, len(BASE_PALETTE)),
-        BASE_PALETTE[:, channel],
-    )
-    for channel in range(4)
-]).astype(np.uint8)
-
-BG = (0, 0, 0, 255)
-PEAK_COLOR = (150, 150, 150, 255)
+from visualizer.config import *
 
 WINDOW = np.hanning(FFT_SIZE).astype(np.float32)
 FREQ = np.fft.rfftfreq(FFT_SIZE, 1.0 / RATE)
@@ -111,8 +50,16 @@ visual_delay = min(VISUAL_DELAY_MAX, max(0.0, VISUAL_DELAY))
 visual_delay_info_until = 0.0
 
 
+remote_events = queue.SimpleQueue()
+
+
 def handle_cec_press(button):
-    """Adjust spectrum timing once per Up/Down press, including while idle."""
+    """Keep CEC input responsive while the display handles queued actions."""
+    remote_events.put(button)
+
+
+def adjust_visual_delay(button):
+    """Adjust spectrum timing once per Up/Down press outside the photo screen."""
     global visual_delay, visual_delay_info_until
     if button not in ("up", "down"):
         return
@@ -131,16 +78,16 @@ def visual_delay_info(now):
     return None
 
 
-def render_delay_info(text):
+def render_delay_info(text, font_size=12):
     """Render a small BGRA label, cached by the display loop until it changes."""
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-    font = (ImageFont.truetype(font_path, 12)
+    font = (ImageFont.truetype(font_path, font_size)
             if os.path.isfile(font_path) else ImageFont.load_default())
     width = font.getbbox(text)[2] + 1
-    image = Image.new("RGB", (width, 24), "black")
+    image = Image.new("RGB", (width, max(24, font_size * 2)), "black")
     ImageDraw.Draw(image).text((0, 0), text, font=font, fill="white")
     rgb = np.asarray(image, dtype=np.uint8)
-    patch = np.empty((24, width, 4), dtype=np.uint8)
+    patch = np.empty((image.height, width, 4), dtype=np.uint8)
     patch[:, :, :3] = rgb[:, :, ::-1]
     patch[:, :, 3] = 255
     return patch
@@ -195,37 +142,32 @@ def local_ipv4():
     return "Not connected"
 
 
-def draw_idle_screen(width, height):
-    """Render a plain, small-text idle screen on black."""
-    ip = local_ipv4()
-    hostname = socket.gethostname()
-    user = getpass.getuser()
+QR_PENDING_MENU = ("Scan to choose your photos", [
+    "Preparing your QR code…", "Selected photos stay on this Pi until deleted.",
+    "No selection? Your saved photos will continue.",
+    "",
+], None)
 
-    lines = [
-        "spotify-visualizer",
-        f"stream to {DEVICE_NAME}",
-        f"ssh {user}@{ip}",
-        f"IP Address: {ip}",
-        f"Hostname: {hostname}",
-    ]
 
-    image = Image.new("RGB", (width, height), "black")
-    draw = ImageDraw.Draw(image)
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-    font = (ImageFont.truetype(font_path, 12)
-            if os.path.isfile(font_path) else ImageFont.load_default())
+def draw_idle_screen(width, height, menu=QR_PENDING_MENU, connection_info=(), delay_text=None):
+    """Idle is the photo-selection QR menu, including casting and SSH details."""
+    title, lines, qr = menu
+    wrapped = [part for line in lines for part in (textwrap.wrap(line, 62) or [""])]
+    canvas = instruction_frame(title, (wrapped[:4] + list(connection_info))[:8], qr,
+        size=(width, height), subtitle="SPOTIFY RECEIVER  /  SPECTRUM VISUALIZER /  GOOGLE PHOTOS SLIDE SHOW",
+        footer="OK: next screen")
+    if delay_text:
+        overlay_photo_info(canvas, render_delay_info(delay_text))
+    return canvas
 
-    x, y = 24, 24
-    for line in lines:
-        draw.text((x, y), line, font=font, fill="white")
-        y += 24
 
-    rgb = np.asarray(image, dtype=np.uint8)
-    bgra = np.empty((height, width, 4), dtype=np.uint8)
-    bgra[:, :, :3] = rgb[:, :, ::-1]
-    bgra[:, :, 3] = 255
-
-    return bgra
+def network_worker(updates):
+    while not stop.is_set():
+        user = os.environ.get("SUDO_USER") or getpass.getuser()
+        ip = local_ipv4()
+        updates.put([f"Spotify Connect: {DEVICE_NAME}",
+                     f"SSH: {user}@{ip}", f"Hostname: {socket.gethostname()}"])
+        stop.wait(IDLE_REFRESH)
 
 
 def read_chunk(fifo, size):
@@ -328,150 +270,149 @@ def main():
     if not os.path.exists(FIFO):
         raise FileNotFoundError(f"FIFO does not exist: {FIFO}")
 
-    with Screen(device=DRM_DEVICE, width=WIDTH, height=HEIGHT) as screen:
-        w, h = screen.get_screen_size()
-        print(f"Resolution: {w}x{h}", flush=True)
-        print(f"Visualizer: {BANDS} bands, {SEGMENTS} segments @ {FPS} FPS", flush=True)
-
-        canvas = np.empty((h, w, 4), dtype=np.uint8)
-        canvas[:] = BG
-
-        margin = int(w * 0.07)
-        gap = max(3, int(w * 0.008))
-        bar_w = (w - 2 * margin - (BANDS - 1) * gap) // BANDS
-        if bar_w < 1:
-            raise ValueError("Too many bands for this display width")
-
-        bottom = int(h * 0.88)
-        top = int(h * 0.13)
-        area_h = bottom - top
-        segment_step = max(2, area_h // SEGMENTS)
-        segment_h = max(1, segment_step - 2)
-        x_positions = [margin + i * (bar_w + gap) for i in range(BANDS)]
-
-        displayed = np.zeros(BANDS, dtype=np.float32)
-        peaks = np.zeros(BANDS, dtype=np.float32)
-        peak_hold = np.zeros(BANDS, dtype=np.float32)
-
-        thread = threading.Thread(target=audio_worker, daemon=True)
-        thread.start()
-
-        cec_thread = threading.Thread(
-            target=monitor_cec, args=(handle_cec_press, stop, CEC_DEVICE), daemon=True,
-        )
-
-        next_frame = previous_frame = time.monotonic()
-        frames = 0
-        fps_start = previous_frame
-        idle_visible = False
-        idle_last_refresh = 0.0
-        delay_text = None
-        delay_patch = None
-
-        try:
+    stop.clear()
+    library = PhotoLibrary(PHOTO_CACHE, PHOTO_TOKEN, PHOTOS_SIZE, stop)
+    photo_frames = PhotoFrames(PHOTOS_SIZE)
+    audio_thread = threading.Thread(target=audio_worker, daemon=True, name="audio")
+    cec_thread = threading.Thread(
+        target=monitor_cec, args=(handle_cec_press, stop, CEC_DEVICE), daemon=True,
+    )
+    info_updates = queue.SimpleQueue()
+    info_thread = threading.Thread(target=network_worker, args=(info_updates,), daemon=True)
+    try:
+        # Keep this DRM object alive for every screen. Reopening it changes HDMI
+        # clocks on some TVs, which can interrupt the independent ALSA stream.
+        with Screen(device=DRM_DEVICE, width=HDMI_SIZE[0], height=HDMI_SIZE[1]) as screen, Output(screen) as output:
+            print(f"HDMI: {output.size}; idle {IDLE_SIZE}; spectrum {SPECTRUM_SIZE}; photos {PHOTOS_SIZE}", flush=True)
+            state = DisplayState(time.monotonic(), IDLE_TIMEOUT, PHOTO_INTERVAL, PHOTO_INTERVAL_STEP)
+            spectrum = Spectrum(SPECTRUM_SIZE)
+            connection_info = [f"Spotify Connect: {DEVICE_NAME}", "SSH: detecting network…"]
+            output.show(draw_idle_screen(*IDLE_SIZE, connection_info=connection_info))
+            audio_thread.start()
             cec_thread.start()
-            while True:
-                start = time.monotonic()
-                dt = min(start - previous_frame, 0.1)
-                previous_frame = start
+            info_thread.start()
+            library.start()
+            library.select()
 
-                with lock:
-                    idle = start - last_audio_activity >= IDLE_TIMEOUT
-                    target = delayed_spectrum(start)
-                    new_delay_text = visual_delay_info(start)
-
-                delay_info_changed = new_delay_text != delay_text
-                if delay_info_changed:
-                    delay_text = new_delay_text
-                    delay_patch = render_delay_info(delay_text) if delay_text is not None else None
-
-                if idle:
-                    refresh_idle = not idle_visible or start - idle_last_refresh >= IDLE_REFRESH
-                    if refresh_idle:
-                        canvas[:] = draw_idle_screen(w, h)
-                        idle_last_refresh = start
-                        idle_visible = True
-                        print("\nIdle screen active", flush=True)
-                    if refresh_idle or delay_info_changed:
-                        show_delay_info(canvas, delay_patch, idle=True)
-                        screen.show(canvas)
-                    # No need to redraw or calculate FFT graphics while idle.
-                    time.sleep(0.10)
-                    next_frame = previous_frame = time.monotonic()
-                    displayed.fill(0)
-                    peaks.fill(0)
-                    peak_hold.fill(0)
-                    continue
-
-                if idle_visible:
-                    print("\nPlayback detected; resuming spectrum", flush=True)
-                    idle_visible = False
-                    canvas[:] = BG
-                    next_frame = previous_frame = time.monotonic()
-                    dt = 0.0
-
-                displayed = np.maximum(target, displayed - BAR_FALLOFF * dt)
-
-                for i in range(BANDS):
-                    if displayed[i] >= peaks[i]:
-                        peaks[i] = displayed[i]
-                        peak_hold[i] = PEAK_HOLD
-                    elif peak_hold[i] > 0:
-                        peak_hold[i] -= dt
-                    else:
-                        peaks[i] = max(
-                            displayed[i], peaks[i] - PEAK_FALLOFF * dt
-                        )
-
-                # Clear the old label before drawing bars, so even small
-                # display modes can draw spectrum beneath the overlay.
-                show_delay_info(canvas, None)
-                canvas[max(0, top - 5):min(h, bottom + 5), :] = BG
-
-                for i in range(BANDS):
-                    x = x_positions[i]
-                    x2 = x + bar_w
-                    count = min(SEGMENTS, max(0, int(displayed[i] * SEGMENTS)))
-
-                    for j in range(count):
-                        y = bottom - (j + 1) * segment_step
-                        canvas[y:y + segment_h, x:x2] = PALETTE[j]
-
-                    peak_seg = int(peaks[i] * SEGMENTS)
-                    if peak_seg > 0:
-                        py = max(top, bottom - (peak_seg + 1) * segment_step)
-                        canvas[py:py + 3, x:x2] = PEAK_COLOR
-
-                if delay_patch is not None:
-                    # Draw after the bars to keep the label on top.
-                    show_delay_info(canvas, delay_patch, clear=False)
-                screen.show(canvas)
-                frames += 1
+            paths = ()
+            menu = QR_PENDING_MENU
+            menu_revision = 0
+            photos_revision = 0
+            last_key = None
+            previous_frame = time.monotonic()
+            visible_mode = Mode.IDLE
+            while not stop.is_set():
                 now = time.monotonic()
-                if now - fps_start >= 5:
-                    print(f"\rFPS: {frames / (now - fps_start):.1f}",
-                          end="", flush=True)
-                    frames = 0
-                    fps_start = now
+                dt = min(now - previous_frame, .1)
+                previous_frame = now
+                with lock:
+                    activity = last_audio_activity
+                    target = delayed_spectrum(now)
+                    delay_text = visual_delay_info(now)
+                state.tick(now, activity, PLAYBACK_ACTIVE_WINDOW)
+                while True:
+                    try:
+                        button = remote_events.get_nowait()
+                    except queue.Empty:
+                        break
+                    if button == "okay":
+                        state.cycle(now)
+                    elif state.mode == Mode.PHOTOS:
+                        state.photo_button(button, now)
+                    else:
+                        adjust_visual_delay(button)
+                if state.mode != visible_mode:
+                    visible_mode = state.mode
+                    last_key = None
+                    if state.mode == Mode.IDLE:
+                        # Never reuse an error from a completed selection while
+                        # requesting a new QR code. Active sessions can be reused.
+                        menu = QR_PENDING_MENU
+                        menu_revision += 1
+                        library.select()
+                    print(f"Screen: {state.mode.value}", flush=True)
+                while True:
+                    try:
+                        connection_info = info_updates.get_nowait()
+                        menu_revision += 1
+                    except queue.Empty:
+                        break
+                while True:
+                    try:
+                        kind, value = library.events.get_nowait()
+                    except queue.Empty:
+                        break
+                    if kind == "photos":
+                        paths = value
+                        photos_revision += 1
+                        state.set_photos(len(paths), now)
+                    elif kind == "menu":
+                        generation, updated_menu = value
+                        if generation == library.generation:
+                            menu = updated_menu
+                            menu_revision += 1
+                    elif kind == "selected" and paths and state.mode == Mode.IDLE:
+                        state.switch(Mode.PHOTOS, now)
+                if state.mode == Mode.IDLE:
+                    key = (state.mode, menu_revision, delay_text)
+                    if key != last_key:
+                        output.show(draw_idle_screen(*IDLE_SIZE, menu=menu,
+                            connection_info=connection_info, delay_text=delay_text))
+                        last_key = key
+                    if paths:
+                        photo_frames.get(state.ordered_photos(paths), state.photo_index)
+                elif state.mode == Mode.SPECTRUM:
+                    canvas = spectrum.render(target, dt)
+                    if delay_text:
+                        show_delay_info(canvas, render_delay_info(delay_text), clear=False)
+                    output.show(canvas)
+                elif not paths:
+                    key = (state.mode, "empty")
+                    if key != last_key:
+                        output.show(instruction_frame("No saved photos", [
+                            "Press OK to open the QR screen and choose photos.",
+                        ], size=PHOTOS_SIZE, subtitle="SPOTIFY RECEIVER  /  SPECTRUM VISUALIZER /  GOOGLE PHOTOS SLIDE SHOW",
+                           footer="OK: QR screen"))
+                        last_key = key
+                else:
+                    state.advance_photo(now)
+                    ordered_paths = state.ordered_photos(paths)
+                    frame = photo_frames.get(ordered_paths, state.photo_index)
+                    interval_text = state.interval_info(now)
+                    key = (state.mode, photos_revision, state.photo_index, id(frame), interval_text)
+                    if frame is not None and key != last_key:
+                        canvas = frame.copy()
+                        if interval_text:
+                            overlay_photo_info(canvas, render_delay_info(interval_text, 22))
+                        output.show(canvas)
+                        last_key = key
+                    elif frame is None and ordered_paths[state.photo_index] in photo_frames.failed:
+                        state.step_photo(1)
+                        if len(photo_frames.failed.intersection(paths)) == len(paths):
+                            paths = ()
+                            state.set_photos(0, now)
+                # The display never sleeps inside audio, photo download or decode work.
+                stop.wait(max(0, (1 / FPS if state.mode == Mode.SPECTRUM else .05) - (time.monotonic() - now)))
+    except KeyboardInterrupt:
+        print("\nStopping...", flush=True)
+    finally:
+        stop.set()
+        library.close()
+        photo_frames.close()
+        for thread in (audio_thread, cec_thread, info_thread):
+            if thread.ident is not None:
+                thread.join(timeout=1)
 
-                next_frame += 1.0 / FPS
-                if next_frame < now:
-                    next_frame = now
-                delay = next_frame - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
 
-        except KeyboardInterrupt:
-            print("\nStopping...", flush=True)
-
-        finally:
-            stop.set()
-            # The worker can be blocked waiting for FIFO data; daemon=True
-            # ensures Ctrl+C can still terminate the application.
-            thread.join(timeout=1)
-            if cec_thread.ident is not None:
-                cec_thread.join(timeout=3)
+def overlay_photo_info(canvas, patch):
+    """Place a readable label on a copy, preserving the cached original frame."""
+    h, w = canvas.shape[:2]
+    x = min(24, max(0, w - 1))
+    y = min(24, max(0, h - 1))
+    bottom, right = min(h, y + patch.shape[0]), min(w, x + patch.shape[1])
+    canvas[y:bottom, x:right] = patch[:bottom - y, :right - x]
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     main()

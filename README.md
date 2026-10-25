@@ -1,6 +1,8 @@
 # Spotify Visualizer
 
-A Spotify Connect receiver with a Winamp-style HDMI spectrum analyzer for Raspberry Pi Zero 2 W running Raspberry Pi OS Lite. [Raspotify](https://github.com/dtcooper/raspotify) sends decoded audio to a Python application, which plays it over HDMI and renders the spectrum directly through DRM/KMS. No desktop environment is required. When playback is idle, the screen displays the Spotify Connect name and network/SSH connection details.
+A Spotify Connect receiver, spectrum analyzer, and Google Photos slideshow for Raspberry Pi Zero 2 W running Raspberry Pi OS Lite. HDMI audio and hardware-scaled graphics work without a desktop.
+
+Development requirements and implementation notes are in [requirements.md](requirements.md).
 
 ## Raspberry Pi Setup
 
@@ -14,7 +16,7 @@ Install dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y git curl python3 python3-venv python3-pip \
+sudo apt install -y git curl build-essential python3 python3-venv python3-pip \
     alsa-utils libdrm-dev libopenblas0-pthread fonts-dejavu-core v4l-utils
 ```
 
@@ -26,6 +28,7 @@ git clone https://github.com/buttweld/spotify-visualizer.git
 cd spotify-visualizer
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/python scripts/build_kms.py
 ```
 
 Install [Raspotify](https://github.com/dtcooper/raspotify) following its official installation instructions. Set the following in `/etc/raspotify/conf` (choose a Spotify Connect device name):
@@ -127,69 +130,101 @@ journalctl -u spotify-visualizer -b -n 50 --no-pager
 journalctl -u raspotify -b -n 50 --no-pager
 ```
 
+## Screens and controls
+
+The three screens are **Idle / QR → Spectrum → Slideshow**. Startup shows Idle. Music starting in Idle opens Spectrum; after 30 seconds of inactivity, the slideshow starts. Idle also moves to the slideshow after 30 seconds. Audio continues in every screen.
+
+Enable HDMI-CEC on your TV to use its remote:
+
+| Button | Idle / Spectrum | Slideshow |
+| --- | --- | --- |
+| OK | Next screen | Next screen |
+| Left / Right | — | Previous / next photo |
+| Up / Down | Spectrum delay ±20 ms | Photo interval ±5 seconds |
+
+Photos play once each in a shuffled order, then reshuffle for the next cycle. Left/Right follows that order. The slideshow defaults to 30 seconds, with a minimum of 5 seconds. Delay and interval labels appear for two seconds after adjustment.
+
 ## Configuration
 
-Edit the constants near the top of `spotify_visualizer.py`:
+Edit `visualizer/config.py`, then restart the service. Defaults:
 
-| Setting | Description |
-| --- | --- |
-| `FIFO` | Raspotify PCM named pipe. |
-| `AUDIO_DEVICE` | HDMI ALSA device; list devices using `aplay -l`. |
-| `DRM_DEVICE` | DRM/KMS display device. |
-| `CEC_DEVICE` | HDMI-CEC adapter; defaults to `/dev/cec0`. |
-| `RATE`, `CHANNELS` | PCM input format (44,100 Hz, stereo). |
-| `FPS`, `HOP` | Display frame rate and PCM samples processed per update. |
-| `VISUAL_DELAY` | Initial spectrum delay in seconds; defaults to `0.300`. |
-| `VISUAL_DELAY_STEP`, `VISUAL_DELAY_MAX` | Remote adjustment step and maximum delay in seconds. |
-| `VISUAL_DELAY_INFO_TIMEOUT` | Seconds to show the delay after a remote adjustment; defaults to `2.0`. |
-| `FFT_SIZE` | FFT window length; larger windows improve frequency resolution but smooth fast changes. |
-| `BANDS`, `SEGMENTS` | Spectrum bars and blocks per bar. |
-| `WIDTH`, `HEIGHT` | Requested HDMI output resolution. |
-| `DB_MIN`, `DB_MAX` | Decibel range mapped to bar height. |
-| `BAR_FALLOFF`, `PEAK_HOLD`, `PEAK_FALLOFF` | Spectrum bar and peak animation timing. |
-| `BASE_PALETTE` | BGRA color gradient for spectrum segments. |
-| `ALSA_BUFFER`, `ALSA_PERIOD` | Requested playback buffer and period in microseconds. |
-| `IDLE_TIMEOUT` | Seconds without non-silent PCM before showing the idle screen. |
-| `IDLE_RMS_THRESHOLD` | Minimum audio RMS level considered active playback. |
-| `IDLE_REFRESH` | Seconds between idle-screen network-information refreshes. |
-| `DEVICE_NAME` | Spotify Connect name read from the `LIBRESPOT_NAME` environment variable; defaults to `raspotify (<hostname>)`. |
+- Idle and photos: **1920 × 1080**.
+- Spectrum: **480 × 270**, hardware-scaled to the fixed **1920 × 1080** HDMI output.
+- Spectrum: **24 FPS**, 38 bands, 21 segments, 300 ms visual delay.
+- Idle timeout and slideshow interval: **30 seconds**.
 
-Defaults include **720 × 400**, **24 FPS**, **38 bands**, **21 segments**, **8192-point FFT**, **60 ms ALSA buffer**, **15 ms ALSA period**, and a **30-second idle timeout**.
+Build the native helper on the Pi after changes to `native/kms_plane.c`:
 
-## HDMI-CEC Remote Control
-
-Enable HDMI-CEC on the TV and select the Pi's HDMI input. The visualizer registers as `SpotifyVis` using `cec-ctl` through `hdmi_cec.py`. The service's `AmbientCapabilities=CAP_NET_ADMIN` setting allows CEC monitoring.
-
-| Button | Action |
-| --- | --- |
-| Up | Increase visual delay by 20 ms. |
-| Down | Decrease visual delay by 20 ms. |
-
-Delay ranges from **0–2000 ms** and affects only the spectrum. Each press logs the value and shows `Delay: +300 ms` for **2 seconds**, below the hostname on the idle screen or at the top left of the spectrum. Further presses restart the timer.
-
-Held-button repeats are ignored. Adjustments work during playback and while idle, and reset to `VISUAL_DELAY` on restart.
-
-## Idle Screen
-
-The idle screen appears **immediately after startup**. After audio playback stops or becomes silent, it reappears following `IDLE_TIMEOUT`. Playback automatically returns the display to the spectrum. The idle screen shows:
-
-```text
-spotify-visualizer
-stream to RPiZero
-ssh <username>@<ip-address>
-IP Address: <ip-address>
-Hostname: <hostname>
+```bash
+.venv/bin/python scripts/build_kms.py
 ```
 
-The SSH username, IP address, and hostname are detected at runtime. The text uses a 12 px DejaVu Sans Mono font with a built-in Pillow font as fallback. Install Python dependencies through `requirements.txt`, which should include **numpy**, **drm-display**, and **Pillow**.
+## Google Photos setup
 
-To display the configured Raspotify device name, the visualizer service loads `EnvironmentFile=-/etc/raspotify/conf` as shown above. Review this file before sharing it; it may contain private configuration. An alternative is to set only `LIBRESPOT_NAME` in a separate service environment file.
+Google Photos is optional. Existing photos resume automatically; selecting new photos requires authorization and internet access.
 
-## Troubleshooting
+### Create credentials
 
-- **Spotify connects but does not play:** Make sure the visualizer is running and the FIFO exists.
-- **No HDMI audio:** Check ALSA devices with `aplay -l` and set `AUDIO_DEVICE` accordingly.
-- **Low FPS:** Reduce `WIDTH` and `HEIGHT` to decrease framebuffer transfer cost.
-- **Audio lags behind graphics:** Adjust ALSA buffering.
-- **CEC permission error:** Add `AmbientCapabilities=CAP_NET_ADMIN` under the visualizer service's `[Service]` section, then reload systemd and restart the service.
-- **Remote buttons do nothing:** Enable TV HDMI-CEC and select the Pi's input. Test with `sudo cec-ctl -d /dev/cec0 --playback --osd-name SpotifyVis --monitor`.
+1. Create or select a project in [Google Cloud Console](https://console.cloud.google.com/).
+2. Enable **Google Photos Picker API** (`photospicker.googleapis.com`).
+3. Choose **User data** in the credentials wizard. This allows a person to grant photo access through OAuth. **Application data** uses a service account, which Google Photos does not support.
+4. Configure **Google Auth Platform → Branding** with the app name and contact emails.
+5. Under **Audience**, choose **External**, keep status **Testing**, then **Test users → Add users**. Add the Google email address you will use for Photos and save.
+6. Under **Data Access**, add `https://www.googleapis.com/auth/photospicker.mediaitems.readonly`.
+7. Under **Clients**, create a **Desktop app** client and **Download JSON**.
+8. Copy the complete downloaded file to the Pi as `~/spotify-visualizer/credentials-google-photos.json`. A client ID ending in `.apps.googleusercontent.com` alone is not the JSON file.
+
+For example, from Windows PowerShell, using your actual download filename and Pi username:
+
+```powershell
+scp "$HOME\Downloads\YOUR_DOWNLOADED_FILE.json" buttweld@pi.local:~/spotify-visualizer/credentials-google-photos.json
+```
+
+### Authorize once
+
+From your computer, connect with SSH port forwarding:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 buttweld@pi.local
+```
+
+`-L` forwards your computer's port 8080 to the Pi's callback listener. Keep this SSH session open. At the Pi prompt, run:
+
+```bash
+cd ~/spotify-visualizer
+.venv/bin/python demos/google_photos_demo.py --authorize
+```
+
+Open the printed link in the browser **on that same computer**, not your phone. Sign in with the test-user account. For your own unverified app, choose **Advanced → Go to [app name] (unsafe)** if shown, then approve access. If authorization times out, rerun the command.
+
+Success saves `.google-photos-token.json`. The tunnel is no longer needed. Run authorization as the visualizer service user; see [ownership troubleshooting](requirements.md#operations-and-troubleshooting) if an earlier demo ran under `sudo`.
+
+### Select photos
+
+On the Idle screen, scan the QR code with your phone, use the same Google account, select photos, and tap **Done**. Photos download and the slideshow starts. Videos are skipped. An empty, cancelled, or expired selection keeps the previous photos.
+
+Photos remain locally until deleted. To clear all downloaded selections, stop the app and run:
+
+```bash
+sudo systemctl stop spotify-visualizer
+rm -rf -- .cache/google-photos-*
+sudo systemctl start spotify-visualizer
+```
+
+Credentials and tokens are private. The sync script excludes them and `.cache/`. See [retention and deletion notes](requirements.md#data-retention-and-deletion) for storage details and Google policy references.
+
+## Updating and troubleshooting
+
+Sync code with `scripts/sync_to_rpi.sh` (`--dry-run` previews changes). Then on the Pi:
+
+```bash
+cd ~/spotify-visualizer
+sudo systemctl stop spotify-visualizer
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python scripts/build_kms.py
+sudo systemctl start spotify-visualizer
+```
+
+The native helper must be built on the Pi; compiled binaries are not synced. Configuration-only changes do not need rebuilding.
+
+Check `journalctl -u spotify-visualizer -f` for errors and spectrum FPS. If audio is missing, check `aplay -l` and `AUDIO_DEVICE`. Enable TV HDMI-CEC for remote control. Additional configuration, demos, and tests are documented in [requirements.md](requirements.md).
